@@ -1,0 +1,252 @@
+---
+title: 'Published code: Nature Communications dec 2022'
+author: "COMMUNITY"
+date: "2022-12-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(segmented)
+library(readxl)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(splines)
+library(effects)
+library(Greg)
+library(glue)
+library(contingencytables)
+library(Hmisc)
+library(rms)
+library(magrittr)
+library(Gmisc)
+library(olsrr)
+library(quantreg)
+library(caret)
+library(table1)
+setHtmlTableTheme("Google")
+```
+
+```{r}
+```{r build_dataset}
+end_of_followup <- as.Date("2022-02-23")
+ds <- raw_ds |> 
+  select(id = `Fas 1 id`, 
+         Age = `Age at Fas 6`,
+         Sex,
+         sample_date = F6_provdag,
+         sero_group, Vaccine3_type,
+         study_status = `Nat Com kohort`,
+         blood_IgG_WT = `F6_P25_IgG_WT`,
+         blood_IgA_WT = `F6_Ser_IgA_Spike (WT)`,
+         blood_IgG_BA1 = `F6_P25_IgG_(B1.1.529;BA.1)`,
+         serum_ACE2_BA.1.1 = `F6_P25_NEUT_(BA.1.1)`,
+         serum_ACE2_BA.2 = `F6_P25_NEUT_(BA.2)`,
+         serum_ACE2_WT = `F6_P25_NEUT_A (WT)`,
+         NT_WT = WT100_Neutralization, 
+         NT_omicron = Omicron100_Neutralization,
+         mucosal_IgA_BA1 = `F6_NPH_Korr_IgA_(BA.1)`,
+         mucosal_IgA_WT = F6_NPH_Korr_IgA_WT,
+         mucosal_IgG_WT = F6_NPH_korr_IgG_WT,
+         CT_nadir = Serie_CT_Lowest,
+         `symtomatiska dagar`, `Feber 1=ja 2=nej`, `Hosta 1=ja 2=nej`, `Snuva 1=ja 2=nej`, `Lukt/smakbortfall`, `Huvudvärk 1=ja 2=nej`, `Halsont 1=ja 2=nej`,
+         Serie_CT_A, Serie_CT_B, Serie_CT_C, Serie_CT_D, Serie_CT_E, Serie_CT_F, Serie_CT_G,
+         whole_genome_sequencing = Odling,
+         breakthrough_date = `pos första datum i studie`) |> 
+  mutate(across(where(is.POSIXt), as.Date),
+         across(c(blood_IgG_WT), as.numeric),
+         across(starts_with("mucosal") | starts_with("blood") | starts_with("serum"), log2, .names = "{col}_log2"), 
+         Infected = factor(study_status,
+                           levels = c("Pos", "Pos, 0 symtom", "Inkl"),
+                           labels = c("Yes", "Yes", "No")),
+         last_observation = case_when(is.na(breakthrough_date) ~ end_of_followup, TRUE ~ breakthrough_date),
+         observation_days = as.numeric(last_observation - sample_date),
+         observation_weeks = observation_days / 7,
+         Sex = factor(Sex, levels = c("Female", "Male")),
+         Asymptomatic = factor(`symtomatiska dagar` == "0", levels = c(FALSE, TRUE), labels = c("No", "Yes")),
+         prior_infection = factor(sero_group,
+                                  levels = c("Sero -", "Possibly -", "Sero +", "Sero -(+)"),
+                                  labels = c("No", "No", "Yes", "Yes")), 
+         Symtomatic_infection = factor(`study_status` == "Pos", 
+                                       levels = c(FALSE, TRUE), 
+                                       labels = c("No", "Yes")),
+         days_to_viral_clearance = case_when(Serie_CT_A >45 ~ 3, 
+                        Serie_CT_B >45 ~ 5, 
+                        Serie_CT_C >45 ~ 7,
+                        Serie_CT_D >45 ~ 9,
+                        Serie_CT_E >45 ~ 11,
+                        Serie_CT_F >45 ~ 13,
+                        Serie_CT_G >45 ~ 15,
+                          TRUE ~ 16),
+         NT_WT = as.numeric(NT_WT),
+         NT_omicron = as.numeric(NT_omicron)) |>  
+  filter(study_status != "Exkl") |> 
+  set_column_labels(blood_IgG_WT_log2 = "IgG wt (log2)")
+
+
+
+cutoff_values <- list(quartiles_IgG_WT = ds |> 
+                        pluck("blood_IgG_WT") |> 
+                        quantile(),
+                      quartiles_IgG_BA1 = ds |> 
+                        pluck("blood_IgG_BA1") |> 
+                        quantile(),
+                       quartiles_ACE2_WT = ds |> 
+                        pluck("serum_ACE2_WT") |> 
+                        quantile(),
+                      quartiles_ACE2_BA.1.1 = ds |> 
+                        pluck("serum_ACE2_BA.1.1") |> 
+                        quantile(na.rm = TRUE),
+                      quartiles_ACE2_BA.2 = ds |> 
+                        pluck("serum_ACE2_BA.2") |> 
+                        quantile(na.rm = TRUE),
+                      quartiles_mucosal_IgA_WT = ds |> 
+                        pluck("mucosal_IgA_WT") |> 
+                        quantile(na.rm = TRUE),
+                      quartiles_mucosal_IgG_WT = ds |> 
+                        pluck("mucosal_IgG_WT") |> 
+                        quantile(na.rm = TRUE),
+                      quartiles_serum_IgA_WT = ds |> 
+                        pluck("blood_IgA_WT") |> 
+                        quantile(na.rm = TRUE),
+                      quartiles_total_IgA = ds |> 
+                        pluck("F6_NPH_Total_IgA") |> 
+                        quantile(na.rm = TRUE),
+                      quartiles_total_IgG = ds |> 
+                        pluck("F6_NPH_Total_IgG") |> 
+                        quantile(na.rm = TRUE))
+```
+
+```{r prepare regression data set}
+reg_data <- ds |> 
+  select(Infected, Age, Sex, sero_group, prior_infection, id,
+         blood_IgG_WT_log2, blood_IgA_WT_log2, blood_IgG_BA1_log2, serum_ACE2_WT_log2,
+         blood_IgG_WT, blood_IgA_WT, blood_IgG_BA1, serum_ACE2_WT, serum_ACE2_BA.1.1, serum_ACE2_BA.2,
+         NT_WT, NT_omicron, mucosal_IgA_WT, mucosal_IgG_WT,
+         Asymptomatic, CT_nadir, whole_genome_sequencing, Symtomatic_infection,
+         `Feber 1=ja 2=nej`, `Hosta 1=ja 2=nej`, `Snuva 1=ja 2=nej`, `Lukt/smakbortfall`, `Huvudvärk 1=ja 2=nej`, `Halsont 1=ja 2=nej`,
+         days_to_viral_clearance,
+         observation_days,
+         observation_weeks) |> 
+  mutate(Age_decade = Age / 10,
+         upper_quartile_s_IgG_WT = factor(blood_IgG_WT >= cutoff_values$quartiles_IgG_WT["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+         upper_quartile_s_IgA_WT = factor(blood_IgA_WT >= cutoff_values$quartiles_serum_IgA_WT["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+         upper_quartile_IgG_BA1 = factor(blood_IgG_BA1 >= cutoff_values$quartiles_IgG_BA1["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+         upper_quartile_ACE2_WT = factor(serum_ACE2_WT >= cutoff_values$quartiles_ACE2_WT["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+         upper_quartile_ACE2_BA.1.1 = factor(serum_ACE2_BA.1.1 >= cutoff_values$quartiles_ACE2_BA.1.1["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+         upper_quartile_ACE2_BA.2 = factor(serum_ACE2_BA.2 >= cutoff_values$quartiles_ACE2_BA.2["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+        upper_quartile_m_IgA_WT = factor(mucosal_IgA_WT >= cutoff_values$quartiles_mucosal_IgA_WT["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes")),
+        upper_quartile_m_IgG_WT = factor(mucosal_IgG_WT >= cutoff_values$quartiles_mucosal_IgG_WT["75%"], 
+                                     levels = c(FALSE, TRUE), 
+                                     labels = c("No", "Yes"))) |> 
+
+```
+
+```{r possion regression}
+poisson_regression <- glm(Infected == "Yes" ~ Age_decade + Sex  +
+                            upper_quartile_m_IgA_WT + blood_IgG_WT_log2 + prior_infection,
+                          offset = log(observation_weeks),
+                          data = reg_data,
+                          family = poisson)
+
+linear_poisson_regression <- poisson_regression |> 
+    update(. ~ . -upper_quartile_IgG_WT + blood_IgG_WT_log2)
+
+nonlinear_poisson_regression <- linear_poisson_regression |> 
+  addNonlinearity(variable = "blood_IgG_WT_log2",
+                  spline_fn = "ns")
+
+
+# Nested models: 
+poisson_regression_without_SIgG <- update(poisson_regression, .~ . - blood_IgG_WT_log2)
+
+poission_regression_without_prior_infection <- update(poisson_regression, .~ . - prior_infection)
+  
+poission_regression_withouth_prior_infection_mIgA <- update(poisson_regression, .~ . - prior_infection - upper_quartile_m_IgA_WT)
+
+poission_regression_without_mIgA <- update(poisson_regression, .~ . - upper_quartile_m_IgA_WT)
+
+
+#prior infected only
+poisson_regression_hybrid <- update(poisson_regression, .~ . - prior_infection, 
+                                    subset = prior_infection == "Yes")
+
+#naive only
+poisson_regression_naive <- update(poisson_regression, .~ . - prior_infection, 
+                                    subset = prior_infection == "No")
+
+#risk of symptomatic infection
+poisson_regression_symptomatic <- glm(Symtomatic_infection == "Yes" ~ Age_decade + Sex + prior_infection + blood_IgG_BA1_log2,
+                          offset = log(observation_weeks),
+                          data = reg_data,
+                          family = poisson)
+
+
+printCrudeAndAdjustedModel(poisson_regression_naive,
+                           add_references = TRUE,
+                           reference_zero_effect = 1)
+
+
+```
+
+```{r goodness of fit of nested models}
+
+lrtest(poisson_regression, poission_regression_without_prior_infection)
+# p= 0.3295
+
+lrtest(poission_regression_without_mIgA, poission_regression_withouth_prior_infection_mIgA)
+# p=0.02
+
+lrtest(poission_regression_without_prior_infection, poission_regression_withouth_prior_infection_mIgA)
+# p= 0.0008
+
+lrtest(poisson_regression, poisson_regression_without_SIgG)
+# p=0.03 
+```
+
+```{r regression nadir Ct}
+Ct_model <- glm(CT_nadir ~ Age + Sex + prior_infection + blood_IgG_WT_log2 + Asymptomatic, data = ds)
+
+printCrudeAndAdjustedModel(Ct_model)
+
+
+# Check how WGS result affects Ct_nadir
+Ct_model_wgs <- lm(CT_nadir ~ Age + Sex + prior_infection + blood_IgG_WT_log2 + whole_genome_sequencing + Asymptomatic, data = reg_data)
+
+#check for normality
+
+plot(Ct_model)
+hist(Ct_model$residuals, main = "Residual Histogram")
+
+```
+WGS is lifted out from the Ct-regression since it cannot be performed on those >30, excluding the ones with high nadir levels. 
+
+
+```{r regression time to viral clearance}
+
+time_to_clearance_model <- lm(days_to_viral_clearance ~ Age + Sex + prior_infection + blood_IgG_WT_log2 + Asymptomatic, data = reg_data) 
+
+time_to_clearance_wgs <- lm(days_to_viral_clearance ~ Age + Sex + prior_infection + blood_IgG_WT_log2 + whole_genome_sequencing, data = ds)
+
+printCrudeAndAdjustedModel(time_to_clearance_model, add_references = TRUE)
+
+```
+
